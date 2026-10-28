@@ -26,6 +26,8 @@ final class AwakeEngine {
 
     // What's in effect
     private(set) var isLidHeld = false
+    /// Why it let go by itself. Agents still working pick up again once the reason is over:
+    /// cooled down or plugged in. Not the same as being turned off by hand.
     private(set) var lastCutoff: Cutoff?
     private(set) var isLidSetUp = false
 
@@ -137,7 +139,9 @@ final class AwakeEngine {
         isManualOn = false
         manualEnd = nil
         scheduleEndTimer()
-        if isHeldForAgents {
+        // Also while a cutoff has let go of them (maybe between two turns), so they don't pick up
+        // again when it's over
+        if isHeldForAgents || (prefs.agentMode && agentsWorkedLately) {
             isHeldForAgents = false
             isAgentHoldSuppressed = true
         }
@@ -181,10 +185,31 @@ final class AwakeEngine {
         return thermal.rawValue >= ProcessInfo.ThermalState.fair.rawValue && isLidHeld && system.isClosedInBag
     }
 
+    /// Too hot once held where the Mac is now: in a bag the first warm level counts whenever the lid
+    /// would be held shut, not only while it is. Letting go of the lid alone makes a warm Mac in a bag
+    /// look fine, so taking a hold and ending a heat cutoff go by this.
+    private var isTooHotToHold: Bool {
+        isTooHot || (prefs.heatGuard && system.thermal.rawValue >= ProcessInfo.ThermalState.fair.rawValue
+            && system.isClosedInBag && isLidSetUp && prefs.lidClosed)
+    }
+
     private var isBatteryLow: Bool {
         guard prefs.batteryGuard, let battery = system.battery, battery.isOnBattery else { return false }
         return battery.percent <= prefs.batteryGuardPercent
     }
+
+    /// How long agents must be quiet before their work counts as done.
+    private var grace: TimeInterval {
+        TimeInterval(max(prefs.agentGraceMinutes, 1) * 60)
+    }
+
+    /// Working, or quiet for less than the grace period, like a model thinking between turns.
+    private var agentsWorkedLately: Bool {
+        agents.isAnyWorking || now().timeIntervalSince(agents.lastWorkingAt ?? .distantPast) < grace
+    }
+
+    /// AgentMonitor reports every 10 seconds, so an older report means the Mac slept since.
+    private static let agentReportLifetime: TimeInterval = 60
 
     func update() {
         // Timers don't count time asleep, so a session can end while the Mac sleeps and the timer fires late
@@ -194,16 +219,18 @@ final class AwakeEngine {
             self.manualEnd = nil
             scheduleEndTimer()
         }
+        // A cutoff ends once its reason has: plugged in, or cool enough to be held where the Mac is
+        // now. A reading back above the limit on battery isn't plugging in, it ticks up as the load drops.
+        if !isAwake, let lastCutoff {
+            let over = lastCutoff == .battery ? !prefs.batteryGuard || system.battery?.isOnBattery != true : !isTooHotToHold
+            if over { self.lastCutoff = nil }
+        }
         updateAgentHold()
 
         if isAwake, isTooHot {
             cut(.heat)
         } else if isAwake, isBatteryLow {
             cut(.battery)
-        } else if !isAwake, let lastCutoff {
-            // The note goes away once the reason has: plugged in, or cooled down
-            let over = lastCutoff == .battery ? !isBatteryLow : system.thermal == .nominal
-            if over { self.lastCutoff = nil }
         }
         apply()
         onChange?()
@@ -216,15 +243,21 @@ final class AwakeEngine {
             return
         }
         if agents.isAnyWorking {
-            if !isHeldForAgents, !isAgentHoldSuppressed, !isTooHot, !isBatteryLow {
+            guard !isHeldForAgents, !isAgentHoldSuppressed, lastCutoff == nil else { return }
+            // Right after a sleep this is still the report from before it; wait for the next check
+            guard now().timeIntervalSince(agents.lastWorkingAt ?? .distantPast) < Self.agentReportLifetime else { return }
+            // Too hot or low already: don't start, and say why
+            if isTooHotToHold {
+                lastCutoff = .heat
+            } else if isBatteryLow {
+                lastCutoff = .battery
+            } else {
                 Log.engine.notice("Agents are working, staying awake")
                 isHeldForAgents = true
-                lastCutoff = nil
             }
             return
         }
         // Quiet for the whole grace period: the work is done
-        let grace = TimeInterval(max(prefs.agentGraceMinutes, 1) * 60)
         let quietFor = now().timeIntervalSince(agents.lastWorkingAt ?? .distantPast)
         guard quietFor >= grace, isHeldForAgents || isAgentHoldSuppressed else { return }
         if isHeldForAgents { Log.engine.notice("Agents are done, letting go") }
@@ -238,10 +271,8 @@ final class AwakeEngine {
         isManualOn = false
         manualEnd = nil
         scheduleEndTimer()
-        if isHeldForAgents {
-            isHeldForAgents = false
-            isAgentHoldSuppressed = true
-        }
+        // Not a pause: agents still working pick up again once the reason is over
+        isHeldForAgents = false
     }
 
     /// Makes the system match the decisions above.
